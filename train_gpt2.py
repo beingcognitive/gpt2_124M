@@ -5,7 +5,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 import inspect
 
-### 아래와 같은 약 100줄의 코드로 기존에 약 2천줄에 달하는 코드를 간소화시켰다.
+### 아래와 같은 약 100줄의 코드로 기존에 약 2천줄에 달하는 코드를 간소화시켰다
 # https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
 class CausalSelfAttention(nn.Module): ### Andrej Karpathy의 다른 강의에서 보였던 Head를 Multi-Head Attention으로 구현한 것을, pytorch에서의 연산 효율성을 위해 하나의 모듈로 재구성한 것일 뿐임. 본질적으로 같다.
 
