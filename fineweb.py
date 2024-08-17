@@ -15,9 +15,8 @@ example doc to highlight the structure of the dataset:
   "token_count": 594
 }
 
-Example of downloading the 100B dataset of FineWebEDU, from root directory:
-python dev/data/fineweb.py -t edu -v 100B
-100B runs for small few hours, depending on your internet and computer.
+Example of downloading the 10B dataset of FineWebEDU, from root directory:
+python dev/data/fineweb.py -t edu -v 10B
 """
 import os
 import argparse
@@ -32,6 +31,18 @@ from transformers import AutoTokenizer
 
 
 # from data_common import write_datafile
+HEADERS_INFO = {
+    "gpt-2": {
+        "magic": 20240520,
+        "version": 1,
+        "token_dtype": np.uint16,
+    },
+    "llama-3": {
+        "magic": 20240801,
+        "version": 7,
+        "token_dtype": np.uint32,
+    },
+}
 
 def write_datafile(filename, toks, model_desc="gpt-2"):
     """
