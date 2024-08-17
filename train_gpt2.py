@@ -5,6 +5,8 @@ import torch.nn as nn
 from torch.nn import functional as F
 import inspect
 
+# torchrun --standalone --nproc_per_node=8 train_gpt2.py
+
 ### 아래와 같은 약 100줄의 코드로 기존에 약 2천줄에 달하는 코드를 간소화시켰다
 # https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
 class CausalSelfAttention(nn.Module): ### Andrej Karpathy의 다른 강의에서 보였던 Head를 Multi-Head Attention으로 구현한 것을, pytorch에서의 연산 효율성을 위해 하나의 모듈로 재구성한 것일 뿐임. 본질적으로 같다.
@@ -213,9 +215,12 @@ class GPT(nn.Module):
 import tiktoken
 
 class DataLoaderLite:
-    def __init__(self, B, T):
+    def __init__(self, B, T, process_rank, num_processes):
         self.B = B
         self.T = T
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+
         with open('input.txt', 'r') as f:
             text = f.read()
         enc = tiktoken.get_encoding('gpt2') # GPT-2 토크나이저 사용
@@ -225,7 +230,8 @@ class DataLoaderLite:
         print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
 
         # state
-        self.current_position = 0
+        # self.current_position = 0
+        self.current_position = self.B * self.T * self.process_rank
     
     def next_batch(self):
         B, T = self.B, self.T
@@ -233,27 +239,64 @@ class DataLoaderLite:
         x = (buf[:-1]).view(B, T) # inputs
         y = (buf[1:]).view(B, T) # targets
         # advance the position in the tensor
-        self.current_position += B * T
+        # self.current_position += B * T
+        self.current_position += B * T * self.num_processes
         # if loading the next batch would be out of bounds, reset
-        if self.current_position + (B * T + 1) > len(self.tokens):
-            self.current_position = 0 # 데이터를 다 사용했으면, 다시 0으로 돌아와서 다음 에폭을 시작하자.
+        # if self.current_position + (B * T + 1) > len(self.tokens):
+        #     self.current_position = 0 # 데이터를 다 사용했으면, 다시 0으로 돌아와서 다음 에폭을 시작하자.
+        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+            self.current_position = self.B * self.T * self.process_rank # 데이터를 다 사용했으면, 다시 0으로 돌아와서 다음 에폭을 시작하자.
         return x, y
 
 #------------------
 # attempt to autodetect the decvice
 import time
+import os
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed import init_process_group, destroy_process_group
+# from torch.distributed.optim import ZeroRedundancyOptimizer
+import torch.distributed as dist
 
-device = "cpu"
-if torch.cuda.is_available():
-    device = "cuda"
-elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    device = "mps"
+ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+if ddp:
+    # use of DDP atm demands CUDA, we set the device appropriately according to rank
+    assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+    # seed_offset = 0 # each process gets the exact same seed
+    # zero_stage = args.zero_stage
+else:
+    ddp_rank = 0
+    ddp_local_rank = 0
+    # zero_stage = 0
+    ddp_world_size = 1
+    master_process = True
+    # seed_offset = 0
+    # select the device
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    print(f"using device: {device}")
+    # device_type = 'cuda' if 'cuda' in device else 'cpu'
 
-### REMOVE THIS
-# device = "cpu"### REMOVE THIS
-### REMOVE THIS
+# device = "cpu"
+# if torch.cuda.is_available():
+#     device = "cuda"
+# elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+#     device = "mps"
 
-print(f"using device: {device}")
+# ### REMOVE THIS
+# # device = "cpu"### REMOVE THIS
+# ### REMOVE THIS
+
+# print(f"using device: {device}")
 
 ##### Code Reproducibility를 위해서 시드 고정
 torch.manual_seed(1337) 
@@ -262,25 +305,34 @@ if torch.cuda.is_available():
 #####
 
 total_batch_size = 524288 # 2**19 ~0.5M, in number of tokens
-B = 4
-T = 32
-assert total_batch_size % (B * T) == 0, "make sure total_batch_size is divisible by B * T"
-grad_accum_steps = total_batch_size // (B * T)
-print(f"total desired batch size: {total_batch_size}")
-print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+B = 32 #16 #4 # micro batch size
+T = 1024 #32 # sequence length
+assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
+grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
+if master_process:
+    print(f"total desired batch size: {total_batch_size}")
+    print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
-train_loader = DataLoaderLite(B=B, T=T)
+print("I am GPU ", ddp_rank)
+print("Bye")
+
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size)
 ### 최적화 #1. 
 torch.set_float32_matmul_precision('high') ### highest 에서 fp32를 사용하는 것 대신, TF32를 사용함으로써, Precision을 아주 살짝 포기하고, 전체 연산 속도를 높인다.
 
-# get logits
-# model = GPT(GPTConfig())
-model = GPT(GPTConfig(vocab_size=50304))
-model.to(device)
-# model = torch.compile(model) ### 이 한줄로 추가 최적화 #3. gcc처럼 컴파일하여 사용하는 셈.
+
+# get logit
 # logits,loss = model(x, y)
 # print(logits.shape) #torch.Size([4, 32, 50257]) 아웃풋 로짓의 크기는 4x32에 대한 50257 토큰개수만큼-. 각 위치 다음에 무엇이 오는가에 대한 로짓값이 됨.
 # print(loss)
+
+# create model
+model = GPT(GPTConfig(vocab_size=50304)) # model = GPT(GPTConfig())
+model.to(device)
+model = torch.compile(model) ### 이 한줄로 추가 최적화 #3. gcc처럼 컴파일하여 사용하는 셈.
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module if ddp else model
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
@@ -301,21 +353,25 @@ def get_lr(it):
 
 # optimize!
 # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8) # Adam에 있는 버그를 수정한 AdamW를 사용한다. SGD보다 최적화 속도가 더 빠름
-optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
 
 for step in range(max_steps):
     t0 = time.time()
-    optimizer.zero_grad() ## 항상 제로그레디언트로 시작해야 함
+    optimizer.zero_grad() ## 항상 제로그레디언트로 시작해야 함 
     loss_accum = 0.0
     for micro_step in range(grad_accum_steps):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
-        # with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        #     logits, loss = model(x, y)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16): ## uncommented
+            logits, loss = model(x, y) ## uncommented
         logits, loss = model(x, y)
         loss = loss / grad_accum_steps
         loss_accum += loss.detach()
-        loss.backward()    
+        if ddp:
+            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
+        loss.backward()
+    if ddp:
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
 
     # with torch.autocast(device_type=device, dtype=torch.bfloat16):
     #     logits, loss = model(x, y)
@@ -325,19 +381,24 @@ for step in range(max_steps):
     # logits, loss = model(x, y)
     # loss.backward()
 
-
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) ## model이 아주 가끔씩 shock을 당하는 일을 막기 위함.
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr    
     optimizer.step() # 파라미터 업데이트
-    # torch.cuda.synchronize() ### CUDA가 있을 때에 GPU와 CPU가 별도로 실행되는 것을 막기 위해, CPU가 GPU의 실행을 기다리는 역할.
+    ##uncommented
+    torch.cuda.synchronize() ### CUDA가 있을 때에 GPU와 CPU가 별도로 실행되는 것을 막기 위해, CPU가 GPU의 실행을 기다리는 역할.
+    ##
     t1 = time.time()
     dt = (t1 - t0) * 1000 # time difference in milliseconds
-    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
-    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-    print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.0f} | tokens_processed: {tokens_processed}")
+    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
+    tokens_per_sec = tokens_processed / (t1 - t0)
+    if master_process:
+        print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.0f} | tokens_processed: {tokens_processed}")
 
+if ddp:
+    destroy_process_group()
+    
 import sys; sys.exit(0) # 이 아래줄은 모두 실행하지 않음.
 
 num_return_sequences = 5
